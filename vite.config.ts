@@ -13,4 +13,10 @@ export default defineConfig({
   build: {
     sourcemap: true,
   },
+  // Component tests mount Svelte components client-side under jsdom; without
+  // this, Vite resolves svelte's server build and `mount()` throws
+  // "not available on the server". See https://svelte.dev/docs/svelte/testing
+  // Only spread `resolve` in under Vitest — an explicit `resolve: undefined`
+  // key can still affect Vite's config-merging outside that context.
+  ...(process.env.VITEST ? { resolve: { conditions: ["browser"] } } : {}),
 });
