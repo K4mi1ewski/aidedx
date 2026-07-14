@@ -18,7 +18,15 @@ Bucket: `aidedx-models`, DC-Podole (`s3p.cloud.cyfronet.pl`), CORS applied via
 `scripts/mirror-upload-s3.sh` (7/7) and spot-checked with `curl -I` (200, `content-length: 2227` on
 `config.json`). To point the app at this mirror, set `env.remoteHost =
 "https://aidedx-models.s3p.cloud.cyfronet.pl/"` — no other code changes needed (see "How the mirror
-works" below). Wiring that switch into the app itself is still a follow-up (not done here).
+works" below).
+
+**Wired into the app**: `src/lib/models/remote.ts` exports `MODEL_MIRROR_HOST`, and
+`src/lib/models/download.ts` sets `env.remoteHost` to it before every `from_pretrained` call. The
+consent-flow manifest (`src/lib/models/manifest.ts`) marks each entry `available: true`/`false`
+depending on whether it's actually been mirrored yet — only `whisper` (now `whisper-small` q8, matching
+this mirror) is `available: true` today, so it's the only entry the download flow, cache-check, and
+progress dialog act on. `qwen`/`llama` stay listed but inert until they get their own
+`mirror-fetch-model.ts` + `mirror-upload-s3.sh` run.
 
 ## Why
 
@@ -67,10 +75,9 @@ was run once against a clean cache to get the ground truth (not a guess):
 | `onnx/decoder_model_merged_quantized.onnx` | 149.49 MB |
 
 **7 files, ~240 MB total.** Source: Hugging Face Hub, repo `onnx-community/whisper-small`, revision
-`main`. (Note: this is real ONNX weight data, ~2.6× the design mock's placeholder "92 MB" number in
-`src/lib/models/manifest.ts` from issue #32, which currently ships `whisper-tiny` as a UI placeholder —
-that manifest needs updating to `whisper-small` separately once ASR is actually wired into the app;
-out of scope here.)
+`main`. (This is real ONNX weight data, ~2.6× the design mock's original placeholder "92 MB"
+`whisper-tiny` entry in `src/lib/models/manifest.ts` from issue #32 — that manifest now ships
+`whisper-small` to match this mirror.)
 
 ## How the mirror works
 
@@ -201,6 +208,42 @@ node --input-type=module -e '
 
 (This exact check — model load succeeding against a local static file server standing in for the
 bucket — was used to validate the staging layout before writing this doc.)
+
+## Debugging download progress
+
+`src/lib/models/download.ts`'s `logProgressEvent()` prints every raw `progress_callback` event
+transformers.js fires (tagged `[aidedx:model-download]`), including `status`, `file`, `loaded`, and
+`total`. Useful if the progress bar ever looks wrong again — see the "fixed: non-monotonic progress
+bar" note below for how to read the log.
+
+To see it:
+
+1. `pnpm run dev`, open the app in a browser, open devtools → Console.
+2. Chrome/Edge: click the log-level dropdown (usually labeled "Default levels") and make sure "Verbose"
+   is checked — `console.debug` is filtered out of the default view. Firefox shows `console.debug` under
+   the "Debug" level, also togglable in the console's level filter.
+3. Filter the console by `aidedx:model-download` to isolate these lines.
+4. Click "Download now" and watch the stream of events for the `whisper` entry.
+
+### Fixed: non-monotonic progress bar
+
+Root cause: a speech-to-text manifest entry loads several files across two `from_pretrained()` calls
+(`AutoProcessor`: config/tokenizer; `WhisperForConditionalGeneration`: encoder + decoder `.onnx`), and
+the encoder + decoder download concurrently (`constructSessions` uses `Promise.all` — see
+`node_modules/@huggingface/transformers/src/models/modeling_utils.js`). Each raw `progress` event is
+scoped to one file's `loaded`/`total`, but the code used to write every event straight into a single
+`fileProgress[entry.id]` slot regardless of which file it came from — so as the encoder and decoder
+interleaved chunks, the reported progress alternated between two different files' byte counts, which
+read as the bar jumping backward.
+
+Fix (`makeProgressCallback` in `download.ts`): track loaded/total per `event.file` in a `Map` local to
+each entry's callback, and report the _sum_ across every file seen so far for that entry. The sum only
+grows as files fill in, so the aggregate is monotonic no matter how the underlying chunks interleave.
+This intentionally doesn't use transformers.js's own `progress_total` aggregate
+(`DefaultProgressCallback`, see `node_modules/@huggingface/transformers/src/utils/core.js`) — that
+aggregate only covers files within a single `from_pretrained()` call, so processor-loaded files and
+model-loaded files would still need combining by hand, and the file-keyed `Map` here already does that
+uniformly for both calls.
 
 ## Cost / growth note
 

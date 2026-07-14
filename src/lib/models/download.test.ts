@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DownloadCancelledError, downloadModelWeights } from "./download.ts";
+import { MODEL_MIRROR_HOST } from "./remote.ts";
 import type { ModelManifestEntry } from "./manifest.ts";
 
 const mocks = vi.hoisted(() => ({
@@ -7,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   whisperFromPretrained: vi.fn(),
   autoTokenizerFromPretrained: vi.fn(),
   causalLMFromPretrained: vi.fn(),
+  env: {} as { remoteHost?: string },
 }));
 
 vi.mock("@huggingface/transformers", () => ({
@@ -14,6 +16,7 @@ vi.mock("@huggingface/transformers", () => ({
   WhisperForConditionalGeneration: { from_pretrained: mocks.whisperFromPretrained },
   AutoTokenizer: { from_pretrained: mocks.autoTokenizerFromPretrained },
   AutoModelForCausalLM: { from_pretrained: mocks.causalLMFromPretrained },
+  env: mocks.env,
 }));
 
 const SPEECH_ENTRY: ModelManifestEntry = {
@@ -23,6 +26,7 @@ const SPEECH_ENTRY: ModelManifestEntry = {
   repo: "org/a",
   dtype: "q8",
   kind: "speech-to-text",
+  available: true,
 };
 const CAUSAL_ENTRY: ModelManifestEntry = {
   id: "b",
@@ -31,6 +35,7 @@ const CAUSAL_ENTRY: ModelManifestEntry = {
   repo: "org/b",
   dtype: "q8",
   kind: "causal-lm",
+  available: true,
 };
 const FAKE_MANIFEST: ModelManifestEntry[] = [SPEECH_ENTRY, CAUSAL_ENTRY];
 
@@ -43,6 +48,7 @@ type ProgressCallback = (event: {
 
 describe("downloadModelWeights", () => {
   beforeEach(() => {
+    delete mocks.env.remoteHost;
     mocks.autoProcessorFromPretrained.mockReset().mockResolvedValue(undefined);
     mocks.autoTokenizerFromPretrained.mockReset().mockResolvedValue(undefined);
     mocks.whisperFromPretrained
@@ -100,10 +106,80 @@ describe("downloadModelWeights", () => {
     expect(events).toContainEqual(["a", { loadedMB: 10, totalMB: 10, done: true }]);
   });
 
+  it("aggregates interleaved progress from concurrently downloading files instead of overwriting (regression)", async () => {
+    // Mirrors transformers.js downloading a speech-to-text entry's encoder and
+    // decoder .onnx files concurrently (`constructSessions`'s `Promise.all`):
+    // their raw per-file `progress` events interleave. Reported loaded/total
+    // must be the sum across both files and must never decrease, or the
+    // progress bar jumps backward.
+    mocks.whisperFromPretrained.mockImplementation(
+      async (_repo: string, opts: { progress_callback?: ProgressCallback }) => {
+        const cb = opts.progress_callback;
+        cb?.({
+          status: "progress",
+          file: "encoder_model.onnx",
+          loaded: 2 * 1024 * 1024,
+          total: 8 * 1024 * 1024,
+        });
+        cb?.({
+          status: "progress",
+          file: "decoder_model.onnx",
+          loaded: 1 * 1024 * 1024,
+          total: 12 * 1024 * 1024,
+        });
+        cb?.({
+          status: "progress",
+          file: "encoder_model.onnx",
+          loaded: 8 * 1024 * 1024,
+          total: 8 * 1024 * 1024,
+        });
+        cb?.({ status: "done", file: "encoder_model.onnx" });
+        cb?.({
+          status: "progress",
+          file: "decoder_model.onnx",
+          loaded: 12 * 1024 * 1024,
+          total: 12 * 1024 * 1024,
+        });
+        cb?.({ status: "done", file: "decoder_model.onnx" });
+      },
+    );
+
+    const events: Array<{ loadedMB: number; totalMB: number; done: boolean }> = [];
+    await downloadModelWeights((_fileId, progress) => events.push(progress), undefined, [
+      SPEECH_ENTRY,
+    ]);
+
+    const totals = events.map((e) => e.totalMB);
+    expect(totals).toEqual([8, 20, 20, 20, 20, 20]);
+
+    const loaded = events.map((e) => e.loadedMB);
+    for (let i = 1; i < loaded.length; i++) {
+      expect(loaded[i]).toBeGreaterThanOrEqual(loaded[i - 1] as number);
+    }
+    expect(loaded.at(-1)).toBe(20);
+    expect(events.at(-1)).toEqual({ loadedMB: 20, totalMB: 20, done: true });
+  });
+
   it("processes every manifest entry in order", async () => {
     await downloadModelWeights(() => {}, undefined, FAKE_MANIFEST);
     expect(mocks.whisperFromPretrained).toHaveBeenCalledTimes(1);
     expect(mocks.causalLMFromPretrained).toHaveBeenCalledTimes(1);
+  });
+
+  it("points env.remoteHost at the Cyfronet S3 mirror before loading a speech-to-text entry", async () => {
+    await downloadModelWeights(() => {}, undefined, [SPEECH_ENTRY]);
+    expect(mocks.env.remoteHost).toBe(MODEL_MIRROR_HOST);
+  });
+
+  it("points env.remoteHost at the Cyfronet S3 mirror before loading a causal-lm entry", async () => {
+    await downloadModelWeights(() => {}, undefined, [CAUSAL_ENTRY]);
+    expect(mocks.env.remoteHost).toBe(MODEL_MIRROR_HOST);
+  });
+
+  it("only downloads available entries by default (whisper only, until qwen/llama are mirrored)", async () => {
+    await downloadModelWeights(() => {});
+    expect(mocks.whisperFromPretrained).toHaveBeenCalledTimes(1);
+    expect(mocks.causalLMFromPretrained).not.toHaveBeenCalled();
   });
 
   it("throws DownloadCancelledError immediately when the signal is already aborted", async () => {
