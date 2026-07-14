@@ -112,6 +112,35 @@ describe("energy + unit parsing", () => {
       unit: "MeV",
     });
   });
+
+  it("drops a negative energy instead of silently treating it as positive", () => {
+    const { intent, incomplete } = matchIntent("Range of -100 MeV protons in water.");
+    expect(intent.energies).toEqual([]);
+    expect(incomplete).toBe(true);
+    expect(intent.confidence).toBeLessThan(0.55);
+  });
+
+  it("does not let a dropped negative energy leak into material matching", () => {
+    // "MeV" from the rejected "-100 MeV" span must not be re-mined as a
+    // material now that it's no longer consumed by a valid energy slot.
+    const intent = matchQueryIntent("Range of -100 MeV protons in water.");
+    expect(intent.materials).toEqual([{ match: "water" }]);
+  });
+
+  it("does not mistake a hyphenated range's dash for a negative sign", () => {
+    // The "-" here separates two numbers ("100-200") rather than negating
+    // one; only "200 MeV" matches the number grammar, and it must be kept
+    // as a real energy, not dropped as if it were "-200 MeV".
+    const { intent, incomplete } = matchIntent("Stopping power of 100-200 MeV protons in water.");
+    expect(intent.energies).toEqual([{ value: 200, unit: "MeV" }]);
+    expect(incomplete).toBe(false);
+  });
+
+  it("does not mistake a spaced hyphenated range's dash for a negative sign", () => {
+    const { intent, incomplete } = matchIntent("Stopping power of 100 - 200 MeV protons in water.");
+    expect(intent.energies).toEqual([{ value: 200, unit: "MeV" }]);
+    expect(incomplete).toBe(false);
+  });
 });
 
 describe("isotope resolution", () => {
