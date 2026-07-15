@@ -22,6 +22,11 @@ class WorkerTranscribeClient implements TranscribeWorkerClient {
 
   constructor() {
     this.#worker = new Worker(new URL("./asr.worker.ts", import.meta.url), { type: "module" });
+    // DEBUG (#9 threading experiment, revertable): forward a thread-count
+    // override chosen in ThreadDebugPanel.svelte to the worker before any
+    // warm/transcribe, so the ORT session is built with it. Ordered before
+    // warm()'s message, so it always wins.
+    this.#sendDebugThreadConfig();
     this.#worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       const message = event.data;
       if (message.type === "token") {
@@ -64,6 +69,27 @@ class WorkerTranscribeClient implements TranscribeWorkerClient {
       const request: WorkerRequest = { type: "transcribe", pcm };
       this.#worker.postMessage(request, [pcm.buffer]);
     });
+  }
+
+  /**
+   * DEBUG (#9): reads `aidedxDebugThreads` from localStorage and posts it as a
+   * config message. Gated behind `?debug` so a stale selection can never affect
+   * a normal visitor — without `?debug` the worker gets no override and the
+   * shipped `threadCountForCores` policy applies.
+   */
+  #sendDebugThreadConfig(): void {
+    try {
+      const hasDebugFlag = new URLSearchParams(globalThis.location?.search ?? "").has("debug");
+      if (!hasDebugFlag) return;
+      const raw = globalThis.localStorage?.getItem("aidedxDebugThreads");
+      if (raw == null || raw === "" || raw === "off") return;
+      const numThreads = Number(raw);
+      if (!Number.isFinite(numThreads) || numThreads <= 0) return;
+      const request: WorkerRequest = { type: "config", numThreads };
+      this.#worker.postMessage(request);
+    } catch {
+      /* localStorage/location may be unavailable (SSR/hardened browsers) — debug-only, ignore */
+    }
   }
 
   warm(): void {

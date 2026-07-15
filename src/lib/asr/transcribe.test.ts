@@ -220,3 +220,50 @@ describe("transcribe", () => {
     expect(constructedStreamer.options.skip_prompt).toBe(true);
   });
 });
+
+describe("threadCountForCores (#9 WASM threading policy)", () => {
+  it("uses half the logical cores, capped at 8 and floored at 1", async () => {
+    const { threadCountForCores } = await import("./transcribe.ts");
+    // half-the-cores
+    expect(threadCountForCores(4)).toBe(2);
+    expect(threadCountForCores(8)).toBe(4);
+    expect(threadCountForCores(12)).toBe(6);
+    // capped at 8 on many-core machines (ORT's own cap is only 4)
+    expect(threadCountForCores(16)).toBe(8);
+    expect(threadCountForCores(32)).toBe(8);
+    // never returns 0 on low-core hardware
+    expect(threadCountForCores(1)).toBe(1);
+    expect(threadCountForCores(2)).toBe(1);
+  });
+
+  it("falls back to a modest 4-core assumption (→2) when hardwareConcurrency is unknown", async () => {
+    const { threadCountForCores } = await import("./transcribe.ts");
+    expect(threadCountForCores(undefined)).toBe(2);
+    expect(threadCountForCores(0)).toBe(2);
+  });
+});
+
+describe("normalizeThreadOverride (#9 debug override validation)", () => {
+  it("accepts positive integers as-is up to the hard cap", async () => {
+    const { normalizeThreadOverride } = await import("./transcribe.ts");
+    expect(normalizeThreadOverride(1)).toBe(1);
+    expect(normalizeThreadOverride(8)).toBe(8);
+    expect(normalizeThreadOverride(12)).toBe(12);
+    expect(normalizeThreadOverride(64)).toBe(64);
+  });
+
+  it("floors fractional values and caps huge ones", async () => {
+    const { normalizeThreadOverride } = await import("./transcribe.ts");
+    expect(normalizeThreadOverride(4.9)).toBe(4);
+    expect(normalizeThreadOverride(1000)).toBe(64);
+  });
+
+  it("rejects null / non-finite / non-positive to null (falls back to the policy)", async () => {
+    const { normalizeThreadOverride } = await import("./transcribe.ts");
+    expect(normalizeThreadOverride(null)).toBeNull();
+    expect(normalizeThreadOverride(0)).toBeNull();
+    expect(normalizeThreadOverride(-4)).toBeNull();
+    expect(normalizeThreadOverride(Number.NaN)).toBeNull();
+    expect(normalizeThreadOverride(Number.POSITIVE_INFINITY)).toBeNull();
+  });
+});

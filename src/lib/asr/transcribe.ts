@@ -107,11 +107,87 @@ interface LoadedPipeline {
 
 let pipelinePromise: Promise<LoadedPipeline> | null = null;
 
+/** Cap on the ORT WASM thread pool — whisper-small's encoder stops scaling
+ * meaningfully past this (`docs/threading-coop-coep.md`), and a fixed ceiling
+ * keeps memory and thread-spawn overhead bounded on many-core desktops. */
+const MAX_ASR_THREADS = 8;
+
+/**
+ * ORT WASM thread count for a given logical-core count.
+ *
+ * Only meaningful when the page is cross-origin isolated (SharedArrayBuffer
+ * available) — otherwise onnxruntime-web forces single-threaded regardless.
+ * Policy: **half the logical cores** (onnxruntime-web's own default heuristic)
+ * but with the cap raised from 4 to `MAX_ASR_THREADS`. Measurements in
+ * `docs/threading-coop-coep.md` show whisper-small's prefill keeps improving
+ * from 4→8 threads (~5.7 s → ~4.7 s steady-state, ~2.5 s best-case on a 12-core
+ * box), which ORT's default cap of 4 leaves on the table. Half — rather than
+ * "all cores" — deliberately leaves headroom for the main thread (Stop button,
+ * Svelte reactivity, the compositor) and avoids oversubscribing hyperthreaded /
+ * big.LITTLE hardware, where the extra logical cores add little for this
+ * matmul-bound workload. Conservative by design; tune via the `?debug` panel
+ * (`ThreadDebugPanel.svelte`) against real target hardware before raising it.
+ *
+ * @param cores `navigator.hardwareConcurrency`, or `undefined` if unknown
+ *   (rare) → treated as a modest 4-core machine.
+ */
+export function threadCountForCores(cores: number | undefined): number {
+  const usable = cores && cores > 0 ? cores : 4;
+  return Math.max(1, Math.min(MAX_ASR_THREADS, Math.floor(usable / 2)));
+}
+
+function resolveThreadCount(): number {
+  return threadCountForCores(globalThis.navigator?.hardwareConcurrency);
+}
+
+/**
+ * `?debug` override for the ORT WASM thread count (see `ThreadDebugPanel.svelte`),
+ * used to A/B thread counts on real hardware. `null` → use `resolveThreadCount()`.
+ * Set via the `config` worker message before the first warm/transcribe.
+ */
+let debugNumThreads: number | null = null;
+
+/** Hard ceiling for the debug override — generous enough to test above the
+ * shipped cap, but bounds the damage from a malformed message value. */
+const DEBUG_THREAD_HARD_MAX = 64;
+
+/**
+ * Normalizes a debug override to a positive integer within
+ * [1, DEBUG_THREAD_HARD_MAX], or `null` for anything non-finite / non-positive.
+ * The value ultimately reaches `env.backends.onnx.wasm.numThreads`, so a bad
+ * `config` message must never spawn a huge thread pool or set a fractional/NaN
+ * count.
+ */
+export function normalizeThreadOverride(n: number | null): number | null {
+  if (n == null || !Number.isFinite(n) || n < 1) return null;
+  return Math.min(DEBUG_THREAD_HARD_MAX, Math.floor(n));
+}
+
+export function setDebugNumThreads(n: number | null): void {
+  debugNumThreads = normalizeThreadOverride(n);
+}
+
 function loadPipeline(): Promise<LoadedPipeline> {
   pipelinePromise ??= (async () => {
     try {
       const { pipeline, env, WhisperTextStreamer } = await import("@huggingface/transformers");
       env.remoteHost = MODEL_MIRROR_HOST;
+      // Multithread the WASM backend when cross-origin isolated. Must be set
+      // before the pipeline builds its ORT sessions. onnxruntime-web forces a
+      // single thread when not isolated, so this is a no-op there.
+      if (globalThis.crossOriginIsolated) {
+        const numThreads = debugNumThreads ?? resolveThreadCount();
+        try {
+          // @ts-expect-error onnxruntime-web env isn't in transformers.js's public types
+          env.backends.onnx.wasm.numThreads = numThreads;
+          console.log(
+            `[asr] ORT numThreads = ${numThreads}` +
+              (debugNumThreads != null ? " (debug override)" : " (policy)"),
+          );
+        } catch (e) {
+          console.log("[asr] could not set ORT numThreads", e);
+        }
+      }
       const asr = await pipeline("automatic-speech-recognition", WHISPER_REPO, {
         dtype: WHISPER_DTYPE,
       });
